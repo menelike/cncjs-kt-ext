@@ -32,8 +32,10 @@ module.exports = class Autolevel {
     this.sckw = new SocketWrap(socket, options.port)
     this.delta = 10.0 // step
     this.feed = 50 // probing feedrate
+    this.travelFeed = 50 // probing feedrate
     this.height = 2 // travelling height
     this.probedPoints = []
+    this.g30 = false;
     this.min_dz = 0;
     this.max_dz = 0;
     this.sum_dz = 0;
@@ -90,8 +92,8 @@ module.exports = class Autolevel {
     })
 
     socket.on('serialport:read', (data) => {
-      if (data.indexOf('PRB') >= 0) {
-        let prbm = /\[PRB:([\+\-\.\d]+),([\+\-\.\d]+),([\+\-\.\d]+),?([\+\-\.\d]+)?:(\d)\]/g.exec(data)
+      if (data.indexOf('Count') >= 0) {
+        let prbm = /X:([\+\-\.\d]+) Y:([\+\-\.\d]+) Z:([\+\-\.\d]+) Count.*/g.exec(data)
         if (prbm) {
           let prb = [parseFloat(prbm[1]), parseFloat(prbm[2]), parseFloat(prbm[3])]
           let pt = {
@@ -129,7 +131,7 @@ module.exports = class Autolevel {
                  this.applyCompensation()
               }
               this.planedPointCount = 0
-              this.wco = { x: 0, y: 0, z: 0 }              
+              this.wco = { x: 0, y: 0, z: 0 }
             }
           }
         }
@@ -143,7 +145,7 @@ module.exports = class Autolevel {
      try {
         this.probeFile = fs.openSync(fileName, "w");
         console.log(`Opened probe file ${fileName}`);
-        this.sckw.sendGcode(`(AL: Opened probe file ${fileName})`)        
+        this.sckw.sendGcode(`(AL: Opened probe file ${fileName})`)
      }
      catch (err) {
         this.probeFile = 0;
@@ -205,6 +207,12 @@ module.exports = class Autolevel {
     let f = /F([\.\+\-\d]+)/gi.exec(cmd)
     if (f) this.feed = parseFloat(f[1])
 
+    let g = /G30([\.\+\-\d]+)/gi.exec(cmd)
+    if (g) this.g30 = !!parseFloat(g[1])
+
+    let t = /T([\.\+\-\d]+)/gi.exec(cmd)
+    if (t) this.travelFeed = parseFloat(t[1])
+
     let margin = this.delta/4;
 
     let mg = /M([\.\+\-\d]+)/gi.exec(cmd)
@@ -225,12 +233,12 @@ module.exports = class Autolevel {
     else {
       area = 'Not specified'
     }
-    console.log(`STEP: ${this.delta} mm HEIGHT:${this.height} mm FEED:${this.feed} MARGIN: ${margin} mm  PROBE ONLY:${this.probeOnly}  Area: ${area}`)
+    console.log(`STEP: ${this.delta} mm HEIGHT:${this.height} mm FEED:${this.feed} TRAVELFEED: ${this.travelFeed} MARGIN: ${margin} mm  PROBE ONLY:${this.probeOnly}  Area: ${area}`)
 
     this.wco = {
-      x: context.mposx - context.posx,
-      y: context.mposy - context.posy,
-      z: context.mposz - context.posz
+      x: 0,
+      y: 0,
+      z: 0
     }
     this.probedPoints = []
     this.planedPointCount = 0
@@ -262,10 +270,10 @@ module.exports = class Autolevel {
     code.push(`G21`)
     code.push(`G90`)
     code.push(`G0 Z${this.height}`)
-    code.push(`G0 X${xmin.toFixed(3)} Y${ymin.toFixed(3)} Z${this.height}`)
-    code.push(`G38.2 Z-${this.height+1} F${this.feed / 2}`)
-    code.push(`G10 L20 P1 Z0`) // set the z zero
-    code.push(`G0 Z${this.height}`)
+    code.push(`G0 X${xmin.toFixed(3)} Y${ymin.toFixed(3)} Z${this.height} F${this.travelFeed}`)
+    code.push(`G38.2 Z-${this.height+1} F${this.feed}`)
+    code.push(`G92 Z0`) // set the z zero, reports probed point
+    code.push(`G0 Z${this.height} F${this.travelFeed}`)
     this.planedPointCount++
 
     let y = ymin - dy
@@ -280,9 +288,15 @@ module.exports = class Autolevel {
         x += dx
         if (x > xmax) x = xmax
         code.push(`(AL: probing point ${this.planedPointCount + 1})`)
-        code.push(`G90 G0 X${x.toFixed(3)} Y${y.toFixed(3)} Z${this.height}`)
-        code.push(`G38.2 Z-${this.height+1} F${this.feed}`)
-        code.push(`G0 Z${this.height}`)
+        code.push(`G0 X${x.toFixed(3)} Y${y.toFixed(3)} Z${this.height} F${this.travelFeed}`)
+        if (this.g30) {
+          code.push(`G30.2 Z-${this.height+1} F${this.feed}`)
+        } else {
+          code.push(`G38.2 Z-${this.height+1} F${this.feed}`)
+        }
+        code.push(`M400`) // wait for moves to finish
+        code.push(`M114`) // get the “current position”
+        code.push(`G0 Z${this.height} F${this.travelFeed}`)
         this.planedPointCount++
       }
     }
@@ -445,51 +459,53 @@ module.exports = class Autolevel {
       let result = []
       lines.forEach(line => {
         let lineStripped = this.stripComments(line)
-        if (/(G38.+|G5.+|G10|G4.+|G92|G92.1)/gi.test(lineStripped)) result.push(lineStripped) // skip compensation for these G-Codes
-        else {
+        if (/^ *G(((0|1|2|3|5|6).*[X,Y,Z])|20|21|90|91)/gi.test(lineStripped)) {
           if (/G91/i.test(lineStripped)) abs = false
           if (/G90/i.test(lineStripped)) abs = true
           if (/G20/i.test(lineStripped)) units = Units.INCHES
           if (/G21/i.test(lineStripped)) units = Units.MILLIMETERS
 
           if (!/(X|Y|Z)/gi.test(lineStripped)) {
-              result.push(lineStripped) // no coordinate change --> copy to output
+            result.push(lineStripped) // no coordinate change --> copy to output
           } else {
-              let xMatch = /X([\.\+\-\d]+)/gi.exec(lineStripped)
-              if (xMatch) pt.x = parseFloat(xMatch[1])
+            let xMatch = /X([\.\+\-\d]+)/gi.exec(lineStripped)
+            if (xMatch) pt.x = parseFloat(xMatch[1])
 
-              let yMatch = /Y([\.\+\-\d]+)/gi.exec(lineStripped)
-              if (yMatch) pt.y = parseFloat(yMatch[1])
+            let yMatch = /Y([\.\+\-\d]+)/gi.exec(lineStripped)
+            if (yMatch) pt.y = parseFloat(yMatch[1])
 
-              let zMatch = /Z([\.\+\-\d]+)/gi.exec(lineStripped)
-              if (zMatch) pt.z = parseFloat(zMatch[1])
+            let zMatch = /Z([\.\+\-\d]+)/gi.exec(lineStripped)
+            if (zMatch) pt.z = parseFloat(zMatch[1])
 
-              if (abs) {
-                // strip coordinates
-                lineStripped = lineStripped.replace(/([XYZ])([\.\+\-\d]+)/gi, '')
-                if (p0_initialized) {
-                    let segs = this.splitToSegments(p0, pt)
-                    for (let seg of segs) {
-                      let cpt = this.compensateZCoord(seg, units)
-                      let newLine = lineStripped + ` X${cpt.x.toFixed(3)} Y${cpt.y.toFixed(3)} Z${cpt.z.toFixed(3)} ; Z${seg.z.toFixed(3)}`
-                      result.push(newLine.trim())
-                    }
-                } else {
-                    let cpt = this.compensateZCoord(pt, units)
-                    let newLine = lineStripped + ` X${cpt.x.toFixed(3)} Y${cpt.y.toFixed(3)} Z${cpt.z.toFixed(3)} ; Z${pt.z.toFixed(3)}`
-                    result.push(newLine.trim())
-                    p0_initialized = true
+            if (abs) {
+              // strip coordinates
+              lineStripped = lineStripped.replace(/([XYZ])([\.\+\-\d]+)/gi, '')
+              if (p0_initialized) {
+                let segs = this.splitToSegments(p0, pt)
+                for (let seg of segs) {
+                  let cpt = this.compensateZCoord(seg, units)
+                  let newLine = lineStripped + ` X${cpt.x.toFixed(3)} Y${cpt.y.toFixed(3)} Z${cpt.z.toFixed(3)} ; Z${seg.z.toFixed(3)}`
+                  result.push(newLine.trim())
                 }
               } else {
-                result.push(lineStripped)
-                console.log('WARNING: using relative mode may not produce correct results')
+                let cpt = this.compensateZCoord(pt, units)
+                let newLine = lineStripped + ` X${cpt.x.toFixed(3)} Y${cpt.y.toFixed(3)} Z${cpt.z.toFixed(3)} ; Z${pt.z.toFixed(3)}`
+                result.push(newLine.trim())
+                p0_initialized = true
               }
-              p0 = {
-                x: pt.x,
-                y: pt.y,
-                z: pt.z
-              } // clone
+            } else {
+              result.push(lineStripped)
+              console.log('WARNING: using relative mode may not produce correct results')
+            }
+            p0 = {
+              x: pt.x,
+              y: pt.y,
+              z: pt.z
+            } // clone
           }
+        }
+        else {
+          result.push(lineStripped) // skip compensation for these G-Codes
         }
       })
       const newgcodeFileName = alFileNamePrefix + this.gcodeFileName;
